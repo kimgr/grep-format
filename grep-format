@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+
+"""
+Reads the output of 'grep -n <pattern>' on stdin and uses clang-format to format
+all matching lines.
+
+Intended use:
+
+    git grep -n "if\(" | grep-format
+
+or
+
+    grep -n "for\(" | grep-format
+
+Formats matching files in-place.
+"""
+
+import argparse
+import fnmatch
+import os
+import sys
+import errno
+import subprocess
+
+
+class RunError(Exception):
+    pass
+
+
+class SyntaxError(Exception):
+    pass
+
+
+class ChildError(Exception):
+    def __init__(self, cmd, exitcode, stdout, stderr):
+        self.cmd = cmd
+        self.exitcode = exitcode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+SUPPORTED_EXTS = {
+    "cpp", "cc", "c++", "cxx", "hpp",
+    "c", "h", "inc",
+    "cl",
+    "m", "mm",
+    "js",
+    "ts",
+    "proto",
+}
+
+
+def is_supported_filetype(filename):
+    _, ext = os.path.splitext(filename)
+    if ext:
+        ext = ext[1:]
+        ext = ext.lower()
+
+    return ext in SUPPORTED_EXTS
+
+
+def run(cmdargs, stdin=None, cwd=None):
+    try:
+        p = subprocess.Popen(cmdargs,
+                             cwd=cwd,
+                             stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE,
+                             stdin=subprocess.PIPE if stdin else None,
+                             universal_newlines=True)
+        stdout, stderr = p.communicate(stdin)
+        if p.returncode != 0:
+            raise ChildError(cmdargs, p.returncode, stdout, stderr)
+        if not isinstance(stdout, str):
+            stdout = stdout.decode("utf-8")
+        return stdout
+    except OSError as error:
+        if error.errno == errno.ENOENT:
+            raise RunError("executable missing: %s" % cmdargs[0])
+        elif error.errno == errno.EACCES:
+            raise RunError("executable permission denied: %s" % cmdargs[0])
+        raise  # traceback for unexpected errors
+
+
+def print_if(flag, msg, **kwargs):
+    if flag:
+        print(msg, **kwargs)
+
+
+def clang_format(opts, filename, lines):
+    if not is_supported_filetype(filename):
+        print_if(opts.verbose, "unsupported filetype: %s" % filename)
+        return False
+    print_if(opts.verbose, "formatting: %s (%d lines)" % (filename, len(lines)))
+
+    cmd = [opts.binary, "-i"]
+    for lineno in lines:
+        cmd += ["-lines", "%s:%s" % (lineno, lineno)]
+    cmd += [filename]
+    run(cmd)
+    return True
+
+
+def parse_grep_output(instream):
+    edits = {}
+    for line in instream.readlines():
+        line = line.strip("\n")
+        parts = line.split(":")
+        if len(parts) < 3:
+            raise SyntaxError("invalid input line: '%s'" % line)
+
+        filename, lineno = parts[0], parts[1]
+        if not filename or not lineno.isdigit():
+            raise SyntaxError("invalid input line: '%s'" % line)
+
+        edits.setdefault(filename, []).append(int(lineno))
+    return edits
+
+
+def main(opts):
+    try:
+        edits = parse_grep_output(sys.stdin)
+        for filename, lines in edits.items():
+            clang_format(opts, filename, lines)
+    except RunError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except SyntaxError as error:
+        print(error, file=sys.stderr)
+        print("hint: use grep -n for line numbers", file=sys.stderr)
+        return 1
+    except ChildError as error:
+        print(error.stderr, file=sys.stderr)
+        return error.exitcode
+    return 0
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__)
+    p.add_argument("--verbose", "-v", action="store_true", default=False,
+                   help="more verbose output")
+    p.add_argument("--binary", default="clang-format",
+                   help="location of binary to use for clang-format")
+
+    opts = p.parse_args()
+    sys.exit(main(opts))
